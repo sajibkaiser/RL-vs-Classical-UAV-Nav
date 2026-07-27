@@ -42,6 +42,10 @@ class DroneDynamicsEnv(gym.Env):
         self.scale = 100.0
         self.wall_width = 0.4  # 40 cm
         self.gap_height = 1.5  # 1.5 meters
+        # --- WIND (new) ---
+        # How hard the wind pushes the drone. Start at 0.0 so nothing
+        # changes yet - this is a dial we'll turn up later.
+        self.wind_strength = 0.0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -78,33 +82,53 @@ class DroneDynamicsEnv(gym.Env):
         elif action == 2: force_y = self.max_lateral_thrust
         elif action == 3: force_x = -self.max_lateral_thrust
         elif action == 4: force_x = self.max_lateral_thrust
-            
-        # 2. QUADROTOR KINEMATICS (F = ma)
-        # Calculate acceleration: a = (F_thrust - F_drag) / mass
-        accel_x = (force_x - (self.linear_drag * self.vel_x)) / self.mass
-        accel_y = (force_y - (self.linear_drag * self.vel_y)) / self.mass
-        
-        # Update Velocity (v = v + at)
-        self.vel_x += accel_x * self.time_step
-        self.vel_y += accel_y * self.time_step
-        
-        # Update Position (x = x + vt)
-        self.drone_x += self.vel_x * self.time_step
-        self.drone_y += self.vel_y * self.time_step
-        
-        # 3. COLLISION LOGIC
+        # --- ADD WIND (new) ---
+        # An extra push, added every moment, with some randomness
+        # so it feels like real gusts rather than a steady fan.
+        gust = self.wind_strength * self.np_random.uniform(-1.0, 1.0)
+        force_y += gust   
+        # 2. QUADROTOR KINEMATICS (F = ma), sub-stepped to prevent wall-ghosting
+        # ------------------------------------------------------------------
+        # BUG: a single 0.1s step let a fast drone move further than a wall's
+        # 0.4m thickness in one go, so its position was never sampled while
+        # actually inside the wall's x-slice and no collision was detected.
+        # FIX: split this step into smaller sub-steps sized so the drone can
+        # never move more than half a wall's thickness per sub-step, and run
+        # the collision check after every sub-step instead of only once.
+        max_speed = (self.max_lateral_thrust + self.wind_strength) / self.linear_drag
+        max_substep_disp = self.wall_width * 0.5
+        n_substeps = max(1, int(np.ceil(max_speed * self.time_step / max_substep_disp)))
+        dt = self.time_step / n_substeps
+
+        # 3. COLLISION LOGIC (checked every sub-step)
         crashed = False
-        if self.drone_x < 0 or self.drone_x > 8.0 or self.drone_y < 0 or self.drone_y > 6.0:
-            crashed = True
-            
-        if self.wall1_x <= self.drone_x <= self.wall1_x + self.wall_width:
-            if not (self.wall1_gap_y <= self.drone_y <= self.wall1_gap_y + self.gap_height):
+        for _ in range(n_substeps):
+            # Calculate acceleration: a = (F_thrust - F_drag) / mass
+            accel_x = (force_x - (self.linear_drag * self.vel_x)) / self.mass
+            accel_y = (force_y - (self.linear_drag * self.vel_y)) / self.mass
+
+            # Update Velocity (v = v + at)
+            self.vel_x += accel_x * dt
+            self.vel_y += accel_y * dt
+
+            # Update Position (x = x + vt)
+            self.drone_x += self.vel_x * dt
+            self.drone_y += self.vel_y * dt
+
+            if self.drone_x < 0 or self.drone_x > 8.0 or self.drone_y < 0 or self.drone_y > 6.0:
                 crashed = True
 
-        if self.wall2_x <= self.drone_x <= self.wall2_x + self.wall_width:
-            if not (self.wall2_gap_y <= self.drone_y <= self.wall2_gap_y + self.gap_height):
-                crashed = True
-        
+            if self.wall1_x <= self.drone_x <= self.wall1_x + self.wall_width:
+                if not (self.wall1_gap_y <= self.drone_y <= self.wall1_gap_y + self.gap_height):
+                    crashed = True
+
+            if self.wall2_x <= self.drone_x <= self.wall2_x + self.wall_width:
+                if not (self.wall2_gap_y <= self.drone_y <= self.wall2_gap_y + self.gap_height):
+                    crashed = True
+
+            if crashed:
+                break
+
         # 4. TRUE DENSE REWARD SHAPING
         dist_to_target = np.sqrt((self.target_x - self.drone_x)**2 + (self.target_y - self.drone_y)**2)
         
@@ -151,4 +175,154 @@ class DroneDynamicsEnv(gym.Env):
         pygame.draw.circle(self.screen, (0, 0, 255), (int(self.drone_x*s), int(self.drone_y*s)), 10)
 
         pygame.display.flip()
-        self.clock.tick(self.metadata["render_fps"])
+        self.clock.tick(15)
+        # ==========================================
+# ==========================================
+# TEST LOOP: Drone flies toward target, with wind
+# ==========================================
+# ==========================================
+# APF PILOT: the "magnetic guide"
+# ==========================================
+import numpy as np
+
+def apf_action(obs, gap_height=1.5, wall_width=0.4):
+    """
+    Works out which way the magnets are pushing/pulling, and returns
+    the single best action to move that way.
+    """
+    drone_x, drone_y = obs[0], obs[1]
+    target_x, target_y = obs[4], obs[5]
+    walls = [(obs[6], obs[7]), (obs[8], obs[9])]   # (wall_x, gap_y)
+
+    # ---- 1. ATTRACTION: the target pulls the drone toward it ----
+    pull_x = target_x - drone_x
+    pull_y = target_y - drone_y
+    # keep the pull a steady size so it doesn't overpower everything far away
+    dist = np.sqrt(pull_x**2 + pull_y**2) + 1e-6
+    pull_x, pull_y = pull_x / dist, pull_y / dist
+
+    # ---- 2. REPULSION: walls push the drone away ----
+    push_x, push_y = 0.0, 0.0
+    influence = 1.5          # walls only matter within 1.5 m
+    strength = 2.0           # how hard they shove
+
+    for wall_x, gap_y in walls:
+        wall_centre = wall_x + wall_width / 2
+        gap_centre = gap_y + gap_height / 2
+        gap_low, gap_high = gap_y, gap_y + gap_height
+
+        x_gap = wall_centre - drone_x        # how far ahead the wall is
+        if abs(x_gap) < influence:
+            closeness = (influence - abs(x_gap)) / influence   # 0 far, 1 touching
+
+            if gap_low < drone_y < gap_high:
+                # Lined up with the opening - the wall barely bothers us.
+                pass
+            else:
+                # Lined up with SOLID wall. Two things happen:
+                # (a) the wall shoves us back the way we came
+                push_x -= np.sign(x_gap) * strength * closeness
+                # (b) we get pulled sideways toward the opening
+                to_gap = gap_centre - drone_y
+                push_y += np.sign(to_gap) * strength * closeness * 1.5
+
+    # ---- 3. REPULSION from the edges of the room ----
+    edge = 0.6
+    if drone_y < edge:            push_y += strength * (edge - drone_y) / edge
+    if drone_y > 6.0 - edge:      push_y -= strength * (drone_y - (6.0 - edge)) / edge
+    if drone_x < edge:            push_x += strength * (edge - drone_x) / edge
+    if drone_x > 8.0 - edge:      push_x -= strength * (drone_x - (8.0 - edge)) / edge
+
+    # ---- 4. ADD IT ALL UP (now with braking) ----
+    vel_x, vel_y = obs[2], obs[3]
+    damping = 0.35          # how much it fights its own momentum
+
+    total_x = pull_x + push_x - damping * vel_x
+    total_y = pull_y + push_y - damping * vel_y
+
+    # ---- 5. Turn that direction into one of our 5 actions ----
+    if abs(total_x) < 0.05 and abs(total_y) < 0.05:
+        return 0                                  # forces cancelled out -> STUCK
+    if abs(total_x) > abs(total_y):
+        return 4 if total_x > 0 else 3            # right / left
+    else:
+        return 2 if total_y > 0 else 1            # down / up
+
+
+def run_episode(env, action_fn, render=False, max_steps=400):
+    """Fly one episode using action_fn(obs) -> action. Returns (outcome, steps_taken)."""
+    obs, info = env.reset()
+    stuck_counter = 0
+
+    for step_number in range(max_steps):
+        action = action_fn(obs)
+
+        # watch for the drone freezing in place (a pilot getting stuck)
+        speed = np.sqrt(obs[2]**2 + obs[3]**2)
+        stuck_counter = stuck_counter + 1 if speed < 0.15 else 0
+        if stuck_counter > 40:
+            return "STUCK", step_number
+
+        obs, reward, terminated, truncated, info = env.step(action)
+        if render:
+            env.render()
+
+        if terminated:
+            return ("REACHED" if reward > 0 else "CRASHED"), step_number
+
+    return "TIMED_OUT", max_steps
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fly the APF pilot in the drone nav environment.")
+    parser.add_argument("--watch", action="store_true",
+                         help="Watch a single flight with rendering on (default: run a headless batch tally).")
+    parser.add_argument("--episodes", type=int, default=50,
+                         help="Number of episodes to run in batch mode (default: 50).")
+    parser.add_argument("--wind", type=float, default=0.3,
+                         help="Wind strength (default: 0.3).")
+    args = parser.parse_args()
+
+    env = DroneDynamicsEnv()
+    env.wind_strength = args.wind
+    apf_pilot = lambda obs: apf_action(obs, env.gap_height, env.wall_width)
+
+    if args.watch:
+        # --- Single visual flight (the original behaviour) ---
+        print("APF pilot flying... (wind =", env.wind_strength, ")")
+        outcome, steps = run_episode(env, apf_pilot, render=True)
+        messages = {
+            "REACHED": f"REACHED the target! (after {steps} steps)",
+            "CRASHED": f"CRASHED. (after {steps} steps)",
+            "STUCK": f"STUCK! The drone froze in place at step {steps}.",
+            "TIMED_OUT": "Ran out of time without reaching the target.",
+        }
+        print(messages[outcome])
+    else:
+        # --- Headless batch run with a tally at the end ---
+        print(f"Running {args.episodes} episodes with the APF pilot (rendering off, wind = {env.wind_strength})...")
+
+        tally = {"REACHED": 0, "CRASHED": 0, "STUCK": 0, "TIMED_OUT": 0}
+        reached_steps = []
+
+        for ep in range(args.episodes):
+            outcome, steps = run_episode(env, apf_pilot, render=False)
+            tally[outcome] += 1
+            if outcome == "REACHED":
+                reached_steps.append(steps)
+
+        avg_steps = (sum(reached_steps) / len(reached_steps)) if reached_steps else None
+
+        print(f"\n--- Tally over {args.episodes} episodes ---")
+        print(f"REACHED:   {tally['REACHED']}")
+        print(f"CRASHED:   {tally['CRASHED']}")
+        print(f"STUCK:     {tally['STUCK']}")
+        print(f"TIMED OUT: {tally['TIMED_OUT']}")
+        if avg_steps is not None:
+            print(f"Average steps for successful runs: {avg_steps:.1f}")
+        else:
+            print("Average steps for successful runs: N/A (no successful runs)")
+
+    env.close()
