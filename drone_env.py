@@ -46,6 +46,10 @@ class DroneDynamicsEnv(gym.Env):
         # How hard the wind pushes the drone. Start at 0.0 so nothing
         # changes yet - this is a dial we'll turn up later.
         self.wind_strength = 0.0
+        # --- SENSOR NOISE ---
+        # Std dev of Gaussian noise added to the drone's own position/velocity
+        # readings, simulating an imperfect sensor. 0.0 = perfect sensing.
+        self.noise_strength = 0.0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -153,6 +157,19 @@ class DroneDynamicsEnv(gym.Env):
         
         return obs, reward, terminated, False, {}
 
+    def get_noisy_obs(self, obs):
+        """
+        Returns a copy of obs with the drone's own position/velocity entries
+        (indices 0-3) perturbed by Gaussian noise, std = noise_strength, as if
+        read from an imperfect onboard sensor. Target/wall entries are left
+        exact, and the environment's true internal state (self.drone_x,
+        self.vel_x, etc.) is untouched - only this returned copy is noisy.
+        """
+        noisy = obs.copy()
+        noise = self.np_random.normal(0.0, self.noise_strength, size=4)
+        noisy[0:4] = noisy[0:4] + noise
+        return noisy.astype(np.float32)
+
     def render(self):
         if not hasattr(self, 'screen'):
             pygame.init()
@@ -249,32 +266,58 @@ def apf_action(obs, gap_height=1.5, wall_width=0.4):
         return 2 if total_y > 0 else 1            # down / up
 
 
-def run_episode(env, action_fn, render=False, max_steps=400):
-    """Fly one episode using action_fn(obs) -> action. Returns (outcome, steps_taken)."""
+def run_episode(env, action_fn, render=False, max_steps=400, shield=None):
+    """
+    Fly one episode using action_fn(obs) -> action.
+
+    The pilot and the shield both act on a NOISY copy of the observation
+    (env.get_noisy_obs, scaled by env.noise_strength) - simulating imperfect
+    sensing - while env.step() and the STUCK check use the environment's true
+    state, so physics and collision detection are never affected by noise.
+
+    If shield is given, every proposed action is passed through
+    shield(env, noisy_obs, proposed_action) -> (action, overridden) before it
+    reaches env.step(), and overridden actions are counted as interventions.
+
+    Returns (outcome, steps_taken, intervention_count).
+    """
     obs, info = env.reset()
     stuck_counter = 0
+    intervention_count = 0
 
     for step_number in range(max_steps):
-        action = action_fn(obs)
+        noisy_obs = env.get_noisy_obs(obs)
+        proposed_action = action_fn(noisy_obs)
 
-        # watch for the drone freezing in place (a pilot getting stuck)
+        if shield is not None:
+            action, overridden = shield(env, noisy_obs, proposed_action)
+            if overridden:
+                intervention_count += 1
+        else:
+            action = proposed_action
+
+        # watch for the drone freezing in place (a pilot getting stuck) -
+        # uses the TRUE velocity, not the noisy sensor reading
         speed = np.sqrt(obs[2]**2 + obs[3]**2)
         stuck_counter = stuck_counter + 1 if speed < 0.15 else 0
         if stuck_counter > 40:
-            return "STUCK", step_number
+            return "STUCK", step_number, intervention_count
 
         obs, reward, terminated, truncated, info = env.step(action)
         if render:
             env.render()
 
         if terminated:
-            return ("REACHED" if reward > 0 else "CRASHED"), step_number
+            return ("REACHED" if reward > 0 else "CRASHED"), step_number, intervention_count
 
-    return "TIMED_OUT", max_steps
+    return "TIMED_OUT", max_steps, intervention_count
 
 
 if __name__ == "__main__":
     import argparse
+    from shields import naive_shield, lookahead_shield, momentum_aware_shield, no_shield
+
+    SHIELDS = {"none": no_shield, "naive": naive_shield, "lookahead": lookahead_shield, "momentum": momentum_aware_shield}
 
     parser = argparse.ArgumentParser(description="Fly the APF pilot in the drone nav environment.")
     parser.add_argument("--watch", action="store_true",
@@ -283,16 +326,22 @@ if __name__ == "__main__":
                          help="Number of episodes to run in batch mode (default: 50).")
     parser.add_argument("--wind", type=float, default=0.3,
                          help="Wind strength (default: 0.3).")
+    parser.add_argument("--shield", choices=["none", "naive", "lookahead", "momentum"], default="none",
+                         help="Safety shield to veto unsafe actions (default: none).")
+    parser.add_argument("--noise", type=float, default=0.0,
+                         help="Sensor noise strength - std dev of Gaussian noise on the pilot's position/velocity readings (default: 0.0).")
     args = parser.parse_args()
 
     env = DroneDynamicsEnv()
     env.wind_strength = args.wind
+    env.noise_strength = args.noise
     apf_pilot = lambda obs: apf_action(obs, env.gap_height, env.wall_width)
+    shield = SHIELDS[args.shield]
 
     if args.watch:
         # --- Single visual flight (the original behaviour) ---
-        print("APF pilot flying... (wind =", env.wind_strength, ")")
-        outcome, steps = run_episode(env, apf_pilot, render=True)
+        print("APF pilot flying... (wind =", env.wind_strength, ", noise =", env.noise_strength, ")")
+        outcome, steps, interventions = run_episode(env, apf_pilot, render=True, shield=shield)
         messages = {
             "REACHED": f"REACHED the target! (after {steps} steps)",
             "CRASHED": f"CRASHED. (after {steps} steps)",
@@ -300,20 +349,24 @@ if __name__ == "__main__":
             "TIMED_OUT": "Ran out of time without reaching the target.",
         }
         print(messages[outcome])
+        print(f"Shield interventions: {interventions}")
     else:
         # --- Headless batch run with a tally at the end ---
-        print(f"Running {args.episodes} episodes with the APF pilot (rendering off, wind = {env.wind_strength})...")
+        print(f"Running {args.episodes} episodes with the APF pilot (rendering off, wind = {env.wind_strength}, shield = {args.shield}, noise = {env.noise_strength})...")
 
         tally = {"REACHED": 0, "CRASHED": 0, "STUCK": 0, "TIMED_OUT": 0}
         reached_steps = []
+        interventions_per_episode = []
 
         for ep in range(args.episodes):
-            outcome, steps = run_episode(env, apf_pilot, render=False)
+            outcome, steps, interventions = run_episode(env, apf_pilot, render=False, shield=shield)
             tally[outcome] += 1
             if outcome == "REACHED":
                 reached_steps.append(steps)
+            interventions_per_episode.append(interventions)
 
         avg_steps = (sum(reached_steps) / len(reached_steps)) if reached_steps else None
+        avg_interventions = sum(interventions_per_episode) / len(interventions_per_episode)
 
         print(f"\n--- Tally over {args.episodes} episodes ---")
         print(f"REACHED:   {tally['REACHED']}")
@@ -324,5 +377,6 @@ if __name__ == "__main__":
             print(f"Average steps for successful runs: {avg_steps:.1f}")
         else:
             print("Average steps for successful runs: N/A (no successful runs)")
+        print(f"Average shield interventions per episode: {avg_interventions:.2f}")
 
     env.close()

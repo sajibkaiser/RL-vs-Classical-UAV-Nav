@@ -26,8 +26,8 @@ model = PPO("MlpPolicy", env, verbose=1)
 
 # 3. Train the AI (Let it crash and learn)
 print("Starting 300,000 timesteps of training. This will take a moment...")
-model.learn(total_timesteps=300000)
+model.learn(total_timesteps=1000000)
 
 # 4. Save the trained "brain" to your computer
-model.save("ppo_drone_model_windy_v2")
+model.save("ppo_drone_model_windy_v3")
 print("Training Complete! The AI brain has been saved as ppo_drone_model_windy_v2.zip")
